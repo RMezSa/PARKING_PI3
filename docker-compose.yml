@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  mosquitto-broker:
+    image: eclipse-mosquitto:2.0.15
+    container_name: mosquitto-broker
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto/config/mosquitto.conf:/mosquitto/config/mosquitto.conf
+      - ./mosquitto/data:/mosquitto/data
+      - ./mosquitto/log:/mosquitto/log
+
+  pi3-subscriber:
+    image: mqtt-subscriber
+    container_name: pi3-subscriber
+    restart: unless-stopped
+    network_mode: host
+    privileged: true
+    devices:
+      - /dev/gpiomem:/dev/gpiomem
+    volumes:
+      - /proc:/proc
+      - ./subscriber.py:/app/subscriber.py
+    depends_on:
+      - mosquitto-broker
+   
+  webpanel:
+    build: ./webpanel
+    container_name: webpanel
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    depends_on:
+      - mosquitto-broker
+    env_file:
+      - ../.env
