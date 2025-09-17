@@ -32,6 +32,7 @@ services:
       - BROKER_HOST=localhost
       - BROKER_PORT=1883
       - TOPIC=deepstream/car_count
+      - GPIOZERO_PIN_FACTORY=lgpio
    
   webpanel:
     build: ./webpanel

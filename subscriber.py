@@ -3,6 +3,7 @@ import time
 import paho.mqtt.client as mqtt
 import threading
 from gpiozero import LED
+from gpiozero.pins import pin_factory
 
 # BCM numbering for Pi 5; maps from physical BOARD pins 37,35,33 -> BCM 26,19,13
 LED_VERDE_BCM = 26
@@ -14,6 +15,7 @@ amarillo = LED(LED_AMARILLO_BCM)
 rojo = LED(LED_ROJO_BCM)
 
 print("Inicio semáforo (Pi 5)")
+print(f"GPIOZero pin factory: {pin_factory}")
 
 total = 0
 total_lock = threading.Lock()  # Para evitar condición de carrera entre hilos
