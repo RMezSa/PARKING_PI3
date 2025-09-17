@@ -20,9 +20,6 @@ services:
     restart: unless-stopped
     network_mode: host
     privileged: true
-    devices:
-      - /dev/gpiochip0:/dev/gpiochip0
-      - /dev/gpiochip1:/dev/gpiochip1
     volumes:
       - /proc:/proc
       - ./subscriber.py:/app/subscriber.py
