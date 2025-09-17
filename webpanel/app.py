@@ -152,6 +152,53 @@ HTML_PANEL = """
         .status-disconnected {
             background-color: #ff4c4c;
         }
+        
+        /* Semáforo virtual */
+        .traffic-light {
+            background-color: #2a2a2a;
+            border-radius: 15px;
+            padding: 15px;
+            margin: 15px auto;
+            width: 90px;
+            box-shadow: 0 0 15px rgba(0,0,0,0.8);
+        }
+        .light {
+            width: 45px;
+            height: 45px;
+            border-radius: 50%;
+            margin: 10px auto;
+            border: 2px solid #444;
+            transition: all 0.3s ease;
+        }
+        .light.red {
+            background-color: #333;
+        }
+        .light.red.active {
+            background-color: #ff4444;
+            box-shadow: 0 0 20px #ff4444;
+            border-color: #ff6666;
+        }
+        .light.yellow {
+            background-color: #333;
+        }
+        .light.yellow.active {
+            background-color: #ffdd44;
+            box-shadow: 0 0 20px #ffdd44;
+            border-color: #ffee66;
+        }
+        .light.green {
+            background-color: #333;
+        }
+        .light.green.active {
+            background-color: #44ff44;
+            box-shadow: 0 0 20px #44ff44;
+            border-color: #66ff66;
+        }
+        .semaforo-status {
+            font-weight: bold;
+            font-size: 1rem;
+            margin-top: 8px;
+        }
     </style>
 </head>
 <body>
@@ -163,6 +210,15 @@ HTML_PANEL = """
             </h2>
             <p id="total" class="counter">{{ total }}</p>
             <p>Número actual de autos</p>
+            
+            <!-- Semáforo Virtual -->
+            <div class="traffic-light">
+                <div class="light red" id="red-light"></div>
+                <div class="light yellow" id="yellow-light"></div>
+                <div class="light green" id="green-light"></div>
+            </div>
+            <div id="semaforo-status" class="semaforo-status text-success">Disponible</div>
+            
             <small id="last-update" class="text-muted">Última actualización: {{ last_update }}</small>
         </div>
         <div class="card text-center">
@@ -198,7 +254,41 @@ HTML_PANEL = """
             console.log('Total actualizado:', data.total);
             document.getElementById('total').innerText = data.total;
             document.getElementById('last-update').innerText = 'Última actualización: ' + new Date().toLocaleTimeString();
+            updateTrafficLight(parseInt(data.total));
         });
+        
+        // Función para actualizar el semáforo virtual
+        function updateTrafficLight(total) {
+            // Limpiar luces
+            document.getElementById('red-light').classList.remove('active');
+            document.getElementById('yellow-light').classList.remove('active');
+            document.getElementById('green-light').classList.remove('active');
+            
+            const statusElement = document.getElementById('semaforo-status');
+            
+            if (total >= 35) {
+                // Rojo - Estacionamiento lleno
+                document.getElementById('red-light').classList.add('active');
+                statusElement.innerText = 'ESTACIONAMIENTO LLENO';
+                statusElement.className = 'semaforo-status text-danger';
+            } else if (total >= 30) {
+                // Amarillo - Casi lleno
+                document.getElementById('yellow-light').classList.add('active');
+                statusElement.innerText = 'CASI LLENO';
+                statusElement.className = 'semaforo-status text-warning';
+            } else {
+                // Verde - Disponible
+                document.getElementById('green-light').classList.add('active');
+                statusElement.innerText = 'DISPONIBLE';
+                statusElement.className = 'semaforo-status text-success';
+            }
+        }
+        
+        // Inicializar semáforo al cargar la página
+        window.onload = function() {
+            const currentTotal = parseInt(document.getElementById('total').innerText) || 0;
+            updateTrafficLight(currentTotal);
+        };
         
         socket.on('action_response', function(data) {
             document.getElementById('message').innerText = data.message;
