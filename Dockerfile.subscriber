@@ -1,0 +1,14 @@
+# Minimal subscriber Dockerfile for Raspberry Pi 5 (arm64)
+FROM python:3.11-slim
+
+# System deps for gpiozero backend (lgpio)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends python3-gpiozero python3-lgpio && \
+    pip install --no-cache-dir paho-mqtt && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY subscriber.py /app/subscriber.py
+
+ENV PYTHONUNBUFFERED=1
+CMD ["python", "-u", "subscriber.py"]

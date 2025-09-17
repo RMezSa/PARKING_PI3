@@ -1,24 +1,27 @@
-import RPi.GPIO as GPIO
+import os
 import time
 import paho.mqtt.client as mqtt
 import threading
+from gpiozero import LED
 
-GPIO.setmode(GPIO.BOARD)
-verde, amarillo, rojo = 37, 35, 33
+# BCM numbering for Pi 5; maps from physical BOARD pins 37,35,33 -> BCM 26,19,13
+LED_VERDE_BCM = 26
+LED_AMARILLO_BCM = 19
+LED_ROJO_BCM = 13
 
-GPIO.setup(verde, GPIO.OUT)
-GPIO.setup(amarillo, GPIO.OUT)
-GPIO.setup(rojo, GPIO.OUT)
+verde = LED(LED_VERDE_BCM)
+amarillo = LED(LED_AMARILLO_BCM)
+rojo = LED(LED_ROJO_BCM)
 
-print("Inicio semáforo")
+print("Inicio semáforo (Pi 5)")
 
 total = 0
 total_lock = threading.Lock()  # Para evitar condición de carrera entre hilos
 
 def set_lights(v, a, r):
-    GPIO.output(verde, v)
-    GPIO.output(amarillo, a)
-    GPIO.output(rojo, r)
+    (verde.on() if v else verde.off())
+    (amarillo.on() if a else amarillo.off())
+    (rojo.on() if r else rojo.off())
 
 def publicar_total_periodicamente():
     while True:
@@ -70,13 +73,12 @@ def on_message(client, userdata, msg):
     except Exception as e:
         print(f"Error al procesar el mensaje: {e}")
 
-broker_ip = "10.244.140.146"
-port = 1883
-topic = "deepstream/car_count"
+broker_ip = os.getenv("BROKER_HOST", "localhost")
+port = int(os.getenv("BROKER_PORT", "1883"))
+topic = os.getenv("TOPIC", "deepstream/car_count")
 
 client = mqtt.Client()
 client.on_message = on_message
-
 client.connect(broker_ip, port)
 client.subscribe(topic)
 
@@ -89,4 +91,9 @@ try:
 except KeyboardInterrupt:
     print("Apagando...")
     set_lights(0, 0, 0)
-    GPIO.cleanup()
+finally:
+    # Ensure LEDs are off on exit
+    try:
+        verde.off(); amarillo.off(); rojo.off()
+    except Exception:
+        pass
