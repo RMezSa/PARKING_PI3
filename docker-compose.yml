@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   mosquitto-broker:
-    image: eclipse-mosquitto:2.0.15
+    image: eclipse-mosquitto:2.0.22
     container_name: mosquitto-broker
     restart: unless-stopped
     ports:
@@ -21,12 +21,13 @@ services:
     network_mode: host
     privileged: true
     volumes:
+      - /dev:/dev
       - /proc:/proc
       - ./subscriber.py:/app/subscriber.py
     depends_on:
       - mosquitto-broker
     environment:
-      - BROKER_HOST=localhost
+      - BROKER_HOST=192.168.101.118
       - BROKER_PORT=1883
       - TOPIC=deepstream/car_count
       - GPIOZERO_PIN_FACTORY=lgpio

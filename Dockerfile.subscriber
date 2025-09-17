@@ -1,14 +1,32 @@
-# Minimal subscriber Dockerfile for Raspberry Pi 5 (arm64)
 FROM python:3.11-slim
 
-# System deps for gpiozero backend (lgpio)
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends python3-gpiozero python3-lgpio && \
-    pip install --no-cache-dir paho-mqtt && \
-    rm -rf /var/lib/apt/lists/*
+# Instalar dependencias del sistema para GPIO en Pi 5
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    python3-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
 
+# Crear grupo gpio con el mismo GID que en Raspberry Pi OS
+RUN groupadd -g 997 gpio
+
+# Crear usuario que pertenezca al grupo gpio
+RUN useradd -m -G gpio -s /bin/bash pi
+
+# Establecer directorio de trabajo
 WORKDIR /app
-COPY subscriber.py /app/subscriber.py
 
-ENV PYTHONUNBUFFERED=1
-CMD ["python", "-u", "subscriber.py"]
+# Instalar dependencias de Python (gpiozero, lgpio, paho-mqtt)
+RUN pip install --no-cache-dir gpiozero lgpio paho-mqtt
+
+# Copiar el script subscriber.py
+COPY subscriber.py .
+
+# Cambiar propietario del directorio
+RUN chown -R pi:gpio /app
+
+# Cambiar a usuario pi
+USER pi
+
+# Comando para ejecutar el script
+CMD ["python3", "-u", "subscriber.py"]

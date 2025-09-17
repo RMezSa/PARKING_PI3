@@ -1,3 +1,17 @@
 mosquitto/data/*.db
 mosquitto/log/*.log
 mqtt-subscriber.tar
+
+# Environment variables with sensitive data
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Docker
+.dockerignore
+
+# Logs
+*.log
