@@ -16,5 +16,6 @@ __pycache__/
 # Logs
 *.log
 
+compose-watchdog.log
 # Additional Python cache patterns
 __pycache__/
