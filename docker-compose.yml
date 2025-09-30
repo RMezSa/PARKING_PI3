@@ -27,7 +27,7 @@ services:
     depends_on:
       - mosquitto-broker
     environment:
-      - BROKER_HOST=192.168.101.118
+      - BROKER_HOST=10.244.134.153
       - BROKER_PORT=1883
       - TOPIC=deepstream/car_count
       - GPIOZERO_PIN_FACTORY=lgpio
