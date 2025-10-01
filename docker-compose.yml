@@ -24,6 +24,7 @@ services:
       - /dev:/dev
       - /proc:/proc
       - ./subscriber.py:/app/subscriber.py
+      - ./iot_hub_client.py:/app/iot_hub_client.py
     depends_on:
       - mosquitto-broker
     environment:
@@ -31,6 +32,7 @@ services:
       - BROKER_PORT=1883
       - TOPIC=deepstream/car_count
       - GPIOZERO_PIN_FACTORY=lgpio
+      - IOT_HUB_CONNECTION_STRING=${IOT_HUB_CONNECTION_STRING}
    
   webpanel:
     build: ./webpanel

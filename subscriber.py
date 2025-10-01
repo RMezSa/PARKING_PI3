@@ -2,7 +2,9 @@ import os
 import time
 import paho.mqtt.client as mqtt
 import threading
+import logging
 from gpiozero import LED, Device
+from iot_hub_client import IoTHubManager
 
 # BCM numbering for Pi 5; maps from physical BOARD pins 37,35,33 -> BCM 26,19,13
 LED_VERDE_BCM = 26
@@ -16,6 +18,27 @@ rojo = LED(LED_ROJO_BCM)
 print("Inicio semáforo (Pi 5)")
 print(f"GPIOZero pin factory: {Device.pin_factory}")
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Initialize IoT Hub client
+iot_hub_connection_string = os.getenv("IOT_HUB_CONNECTION_STRING")
+iot_hub_client = None
+
+if iot_hub_connection_string:
+    try:
+        iot_hub_manager = IoTHubManager(iot_hub_connection_string)
+        if iot_hub_manager.connect():
+            logger.info("Successfully connected to Azure IoT Hub")
+        else:
+            logger.warning("Failed to connect to Azure IoT Hub")
+    except Exception as e:
+        logger.error(f"Error initializing IoT Hub client: {e}")
+        iot_hub_manager = None
+else:
+    logger.warning("IOT_HUB_CONNECTION_STRING not provided - IoT Hub integration disabled")
+
 total = 0
 total_lock = threading.Lock()  # Para evitar condición de carrera entre hilos
 
@@ -27,38 +50,65 @@ def set_lights(v, a, r):
 def publicar_total_periodicamente():
     while True:
         with total_lock:
-            client.publish("estacionamiento/total", str(total))
+            current_total = total
+            # Publish to MQTT
+            client.publish("estacionamiento/total", str(current_total))
+            
+            # Send periodic update to IoT Hub
+            if iot_hub_client:
+                try:
+                    iot_hub_client.send_parking_event("periodic", current_total)
+                except Exception as e:
+                    logger.error(f"Error sending periodic update to IoT Hub: {e}")
+                    
         time.sleep(5)
 
 def on_message(client, userdata, msg):
     global total
     try:
         payload = msg.payload.decode().strip().lower()
+        event_type = None
 
         with total_lock:
             if "entry" in payload:
                 total += 1
+                event_type = "entry"
                 print(f"Entry → Total: {total}")
 
             elif payload == "exit":
                 total -= 1
                 if total < 0:
                     total = 0
+                event_type = "exit"
                 print(f"Exit → Total: {total}")
 
             elif payload == "reset":
                 total = 0
+                event_type = "reset"
                 print("Reset → Total: 0")
 
             elif payload == "setfull":
                 total = 35
+                event_type = "setfull"
                 print("SetFull → Total: 35")
 
             else:
                 print(repr(payload))
                 return
 
+            # Publish to MQTT
             client.publish("estacionamiento/total", str(total), retain=True)
+            
+            # Send event to IoT Hub
+            if iot_hub_manager and event_type:
+                try:
+                    success = iot_hub_manager.send_parking_event(event_type, total)
+                    if success:
+                        logger.info(f"Sent {event_type} event to IoT Hub - Total: {total}")
+                    else:
+                        logger.warning(f"Failed to send {event_type} event to IoT Hub")
+                except Exception as e:
+                    logger.error(f"Error sending {event_type} event to IoT Hub: {e}")
 
             # Actualizar luces
             if total >= 35:
@@ -98,3 +148,11 @@ finally:
         verde.off(); amarillo.off(); rojo.off()
     except Exception:
         pass
+    
+    # Disconnect from IoT Hub
+    if iot_hub_manager:
+        try:
+            logger.info("Disconnecting from Azure IoT Hub...")
+            iot_hub_manager.disconnect()
+        except Exception as e:
+            logger.error(f"Error disconnecting from IoT Hub: {e}")

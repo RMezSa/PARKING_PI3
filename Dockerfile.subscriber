@@ -16,11 +16,12 @@ RUN useradd -m -G gpio -s /bin/bash pi
 # Establecer directorio de trabajo
 WORKDIR /app
 
-# Instalar dependencias de Python (gpiozero, lgpio, paho-mqtt)
-RUN pip install --no-cache-dir gpiozero lgpio paho-mqtt
+# Instalar dependencias de Python (gpiozero, lgpio, paho-mqtt, azure-iot-device)
+RUN pip install --no-cache-dir gpiozero lgpio paho-mqtt azure-iot-device
 
-# Copiar el script subscriber.py
+# Copiar los scripts
 COPY subscriber.py .
+COPY iot_hub_client.py .
 
 # Cambiar propietario del directorio
 RUN chown -R pi:gpio /app

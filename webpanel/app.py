@@ -6,6 +6,8 @@ import time
 import os
 import threading
 import logging
+from datetime import datetime
+import pytz
 from dotenv import load_dotenv
 
 # Cargar variables de entorno desde .env
@@ -36,6 +38,13 @@ if not MQTT_BROKER:
 mqtt_client = None
 current_total = "0"
 is_connected = False
+
+def get_mexico_city_time():
+    """Obtener la hora actual en el huso horario de Ciudad de México"""
+    mexico_tz = pytz.timezone('America/Mexico_City')
+    utc_now = datetime.utcnow().replace(tzinfo=pytz.utc)
+    mexico_time = utc_now.astimezone(mexico_tz)
+    return mexico_time.strftime("%d/%m/%Y %H:%M:%S")
 
 HTML_LOGIN = """
 <!DOCTYPE html>
@@ -199,9 +208,33 @@ HTML_PANEL = """
             font-size: 1rem;
             margin-top: 8px;
         }
+        .timestamp-display {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background-color: rgba(30, 30, 30, 0.9);
+            color: #76B900;
+            padding: 10px 15px;
+            border-radius: 8px;
+            font-size: 0.9rem;
+            font-weight: bold;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.3);
+            z-index: 1000;
+        }
+        .timestamp-label {
+            color: #ccc;
+            font-size: 0.8rem;
+            display: block;
+        }
     </style>
 </head>
 <body>
+    <!-- Timestamp Display -->
+    <div class="timestamp-display">
+        <span class="timestamp-label">Última actualización:</span>
+        <span id="current-timestamp">{{ last_update }}</span>
+    </div>
+    
     <div class="container">
         <div class="card text-center mb-4">
             <h2 class="mb-3">
@@ -253,7 +286,27 @@ HTML_PANEL = """
         socket.on('total_update', function(data) {
             console.log('Total actualizado:', data.total);
             document.getElementById('total').innerText = data.total;
-            document.getElementById('last-update').innerText = 'Última actualización: ' + new Date().toLocaleTimeString();
+            
+            // Update timestamps
+            if (data.timestamp) {
+                document.getElementById('current-timestamp').innerText = data.timestamp;
+                document.getElementById('last-update').innerText = 'Última actualización: ' + data.timestamp;
+            } else {
+                // Fallback to current time if timestamp not provided
+                const now = new Date();
+                const timeString = now.toLocaleString('es-MX', {
+                    timeZone: 'America/Mexico_City',
+                    day: '2-digit',
+                    month: '2-digit', 
+                    year: 'numeric',
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    second: '2-digit'
+                });
+                document.getElementById('current-timestamp').innerText = timeString;
+                document.getElementById('last-update').innerText = 'Última actualización: ' + timeString;
+            }
+            
             updateTrafficLight(parseInt(data.total));
         });
         
@@ -284,10 +337,50 @@ HTML_PANEL = """
             }
         }
         
-        // Inicializar semáforo al cargar la página
+        // Función para actualizar la hora actual cada minuto
+        function updateCurrentTime() {
+            const now = new Date();
+            const timeString = now.toLocaleString('es-MX', {
+                timeZone: 'America/Mexico_City',
+                day: '2-digit',
+                month: '2-digit', 
+                year: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit'
+            });
+            
+            // Solo actualizar si no hemos recibido una actualización reciente del servidor
+            const lastUpdateElement = document.getElementById('current-timestamp');
+            const lastUpdate = lastUpdateElement.innerText;
+            
+            // Si la última actualización es de hace más de 2 minutos, mostrar la hora actual
+            if (lastUpdate) {
+                try {
+                    const [datePart, timePart] = lastUpdate.split(' ');
+                    const [day, month, year] = datePart.split('/');
+                    const [hour, minute, second] = timePart.split(':');
+                    const lastUpdateTime = new Date(year, month - 1, day, hour, minute, second);
+                    const timeDiff = now - lastUpdateTime;
+                    
+                    // Si han pasado más de 2 minutos (120000 ms), actualizar con la hora actual
+                    if (timeDiff > 120000) {
+                        lastUpdateElement.innerText = timeString;
+                    }
+                } catch (e) {
+                    // Si hay error parseando, actualizar con la hora actual
+                    lastUpdateElement.innerText = timeString;
+                }
+            }
+        }
+        
+        // Inicializar semáforo al cargar la página y configurar actualizaciones periódicas
         window.onload = function() {
             const currentTotal = parseInt(document.getElementById('total').innerText) || 0;
             updateTrafficLight(currentTotal);
+            
+            // Actualizar la hora cada 30 segundos
+            setInterval(updateCurrentTime, 30000);
         };
         
         socket.on('action_response', function(data) {
@@ -344,7 +437,7 @@ class MQTTManager:
                 current_total = new_total
                 logger.info(f"Total actualizado: {current_total}")
                 # Enviar actualización via WebSocket
-                socketio.emit('total_update', {'total': current_total})
+                socketio.emit('total_update', {'total': current_total, 'timestamp': get_mexico_city_time()})
         except Exception as e:
             logger.error(f"Error procesando mensaje MQTT: {e}")
     
@@ -408,7 +501,7 @@ def control():
 
     msg = session.pop("msg", "")
     return render_template_string(HTML_PANEL, msg=msg, total=current_total, 
-                                last_update=time.strftime("%H:%M:%S"))
+                                last_update=get_mexico_city_time())
 
 @app.route("/get_total")
 def get_total():
@@ -423,7 +516,7 @@ def logout():
 @socketio.on('connect')
 def handle_connect():
     logger.info('Cliente WebSocket conectado')
-    emit('total_update', {'total': current_total})
+    emit('total_update', {'total': current_total, 'timestamp': get_mexico_city_time()})
 
 @socketio.on('disconnect')
 def handle_disconnect():
