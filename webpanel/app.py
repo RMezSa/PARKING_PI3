@@ -38,6 +38,7 @@ if not MQTT_BROKER:
 mqtt_client = None
 current_total = "0"
 is_connected = False
+last_event_timestamp = None
 
 def get_mexico_city_time():
     """Obtener la hora actual en el huso horario de Ciudad de México"""
@@ -287,27 +288,21 @@ HTML_PANEL = """
             console.log('Total actualizado:', data.total);
             document.getElementById('total').innerText = data.total;
             
-            // Update timestamps
+            // Update timestamps only if provided
             if (data.timestamp) {
                 document.getElementById('current-timestamp').innerText = data.timestamp;
                 document.getElementById('last-update').innerText = 'Última actualización: ' + data.timestamp;
-            } else {
-                // Fallback to current time if timestamp not provided
-                const now = new Date();
-                const timeString = now.toLocaleString('es-MX', {
-                    timeZone: 'America/Mexico_City',
-                    day: '2-digit',
-                    month: '2-digit', 
-                    year: 'numeric',
-                    hour: '2-digit',
-                    minute: '2-digit',
-                    second: '2-digit'
-                });
-                document.getElementById('current-timestamp').innerText = timeString;
-                document.getElementById('last-update').innerText = 'Última actualización: ' + timeString;
             }
             
             updateTrafficLight(parseInt(data.total));
+        });
+        
+        // Handle timestamp-only updates (from button actions)
+        socket.on('timestamp_update', function(data) {
+            if (data.timestamp) {
+                document.getElementById('current-timestamp').innerText = data.timestamp;
+                document.getElementById('last-update').innerText = 'Última actualización: ' + data.timestamp;
+            }
         });
         
         // Función para actualizar el semáforo virtual
@@ -337,50 +332,10 @@ HTML_PANEL = """
             }
         }
         
-        // Función para actualizar la hora actual cada minuto
-        function updateCurrentTime() {
-            const now = new Date();
-            const timeString = now.toLocaleString('es-MX', {
-                timeZone: 'America/Mexico_City',
-                day: '2-digit',
-                month: '2-digit', 
-                year: 'numeric',
-                hour: '2-digit',
-                minute: '2-digit',
-                second: '2-digit'
-            });
-            
-            // Solo actualizar si no hemos recibido una actualización reciente del servidor
-            const lastUpdateElement = document.getElementById('current-timestamp');
-            const lastUpdate = lastUpdateElement.innerText;
-            
-            // Si la última actualización es de hace más de 2 minutos, mostrar la hora actual
-            if (lastUpdate) {
-                try {
-                    const [datePart, timePart] = lastUpdate.split(' ');
-                    const [day, month, year] = datePart.split('/');
-                    const [hour, minute, second] = timePart.split(':');
-                    const lastUpdateTime = new Date(year, month - 1, day, hour, minute, second);
-                    const timeDiff = now - lastUpdateTime;
-                    
-                    // Si han pasado más de 2 minutos (120000 ms), actualizar con la hora actual
-                    if (timeDiff > 120000) {
-                        lastUpdateElement.innerText = timeString;
-                    }
-                } catch (e) {
-                    // Si hay error parseando, actualizar con la hora actual
-                    lastUpdateElement.innerText = timeString;
-                }
-            }
-        }
-        
-        // Inicializar semáforo al cargar la página y configurar actualizaciones periódicas
+        // Inicializar semáforo al cargar la página
         window.onload = function() {
             const currentTotal = parseInt(document.getElementById('total').innerText) || 0;
             updateTrafficLight(currentTotal);
-            
-            // Actualizar la hora cada 30 segundos
-            setInterval(updateCurrentTime, 30000);
         };
         
         socket.on('action_response', function(data) {
@@ -430,14 +385,15 @@ class MQTTManager:
             self.schedule_reconnect()
     
     def on_message(self, client, userdata, msg):
-        global current_total
+        global current_total, last_event_timestamp
         try:
             new_total = msg.payload.decode().strip()
             if new_total != current_total:
                 current_total = new_total
+                last_event_timestamp = get_mexico_city_time()  # Update last event timestamp
                 logger.info(f"Total actualizado: {current_total}")
                 # Enviar actualización via WebSocket
-                socketio.emit('total_update', {'total': current_total, 'timestamp': get_mexico_city_time()})
+                socketio.emit('total_update', {'total': current_total, 'timestamp': last_event_timestamp})
         except Exception as e:
             logger.error(f"Error procesando mensaje MQTT: {e}")
     
@@ -501,7 +457,7 @@ def control():
 
     msg = session.pop("msg", "")
     return render_template_string(HTML_PANEL, msg=msg, total=current_total, 
-                                last_update=get_mexico_city_time())
+                                last_update=last_event_timestamp or "Sin eventos recientes")
 
 @app.route("/get_total")
 def get_total():
@@ -516,7 +472,7 @@ def logout():
 @socketio.on('connect')
 def handle_connect():
     logger.info('Cliente WebSocket conectado')
-    emit('total_update', {'total': current_total, 'timestamp': get_mexico_city_time()})
+    emit('total_update', {'total': current_total, 'timestamp': last_event_timestamp or "Sin eventos recientes"})
 
 @socketio.on('disconnect')
 def handle_disconnect():
@@ -524,11 +480,15 @@ def handle_disconnect():
 
 @socketio.on('send_action')
 def handle_action(data):
+    global last_event_timestamp
     action = data.get('action', '')
     if action in ["Entry", "Exit", "Reset", "SetFull"]:
         success = mqtt_manager.publish_action(action)
         if success:
+            last_event_timestamp = get_mexico_city_time()  # Update last event timestamp when button is pressed
             message = f"Acción enviada: {action}"
+            # Also emit timestamp update to all clients
+            socketio.emit('timestamp_update', {'timestamp': last_event_timestamp})
         else:
             message = f"Error enviando acción: {action} (MQTT desconectado)"
     else:
