@@ -44,3 +44,16 @@ services:
       - mosquitto-broker
     env_file:
       - ./.env
+
+  telegram-bot:
+    build: ./telegram_bot
+    container_name: telegram-bot
+    restart: unless-stopped
+    depends_on:
+      - mosquitto-broker
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - MQTT_BROKER=${MQTT_BROKER}
+      - MQTT_PORT=${MQTT_PORT:-1883}
+    volumes:
+      - ./telegram_bot/data:/app/data

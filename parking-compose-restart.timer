@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Docker Compose Restart Timer at 4:30 AM
+Requires=parking-compose-restart.service
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+Persistent=true
+Unit=parking-compose-restart.service
+
+[Install]
+WantedBy=timers.target
