@@ -29,6 +29,7 @@ POLLING_INTERVAL = 2  # seconds between polling
 MQTT_BROKER = os.environ.get("MQTT_BROKER", "mosquitto-broker")
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
 TOTAL_TOPIC = "estacionamiento/total"
+LED_STATE_TOPIC = "estacionamiento/leds_state"
 COMMAND_TOPIC = "deepstream/car_count"
 MAX_PARKING_SPACES = 35  # Total capacity
 LOGS_SCRIPT_PATH = "/host/get_docker_logs.sh"
@@ -46,6 +47,7 @@ logger = logging.getLogger(__name__)
 
 # Global state
 current_total = 0
+leds_state = "ON"  # Default to ON
 last_update_time = None
 mqtt_connected = False
 scheduler = None
@@ -225,10 +227,11 @@ def init_scheduler():
 class MQTTListener:
     """Handle MQTT connection and listen for parking updates"""
     
-    def __init__(self, broker, port, topic):
+    def __init__(self, broker, port, topic, led_topic):
         self.broker = broker
         self.port = port
         self.topic = topic
+        self.led_topic = led_topic
         self.client = None
         self.is_connected = False
         
@@ -239,7 +242,8 @@ class MQTTListener:
             mqtt_connected = True
             logger.info("MQTT connected successfully")
             client.subscribe(self.topic)
-            logger.info(f"Subscribed to topic: {self.topic}")
+            client.subscribe(self.led_topic)
+            logger.info(f"Subscribed to topics: {self.topic}, {self.led_topic}")
         else:
             self.is_connected = False
             mqtt_connected = False
@@ -254,13 +258,26 @@ class MQTTListener:
             logger.info("Unexpected disconnection, will attempt to reconnect...")
     
     def on_message(self, client, userdata, msg):
-        global current_total, last_update_time
+        global current_total, last_update_time, leds_state
         try:
-            new_total = int(msg.payload.decode().strip())
-            if new_total != current_total:
-                logger.info(f"Parking count updated: {current_total} -> {new_total}")
-                current_total = new_total
-                last_update_time = get_mexico_city_time()
+            topic = msg.topic
+            payload = msg.payload.decode().strip()
+            
+            if topic == self.topic:
+                # Total parking count update
+                new_total = int(payload)
+                if new_total != current_total:
+                    logger.info(f"Parking count updated: {current_total} -> {new_total}")
+                    current_total = new_total
+                    last_update_time = get_mexico_city_time()
+            
+            elif topic == self.led_topic:
+                # LED state update
+                new_state = payload.upper()
+                if new_state in ["ON", "OFF"] and new_state != leds_state:
+                    logger.info(f"LED state updated: {leds_state} -> {new_state}")
+                    leds_state = new_state
+                    
         except Exception as e:
             logger.error(f"Error processing MQTT message: {e}")
     
@@ -288,7 +305,7 @@ def get_parking_data():
     Returns:
         str: Formatted parking data message
     """
-    global current_total, last_update_time
+    global current_total, last_update_time, leds_state
     
     available = MAX_PARKING_SPACES - current_total
     occupied = current_total
@@ -308,6 +325,11 @@ def get_parking_data():
     message = f"🅿️ <b>Parking Status - {status_text}</b> {status_emoji}\n\n"
     message += f"📊 <b>Occupied:</b> {occupied}/{MAX_PARKING_SPACES} spaces\n"
     message += f"✅ <b>Available:</b> {available}/{MAX_PARKING_SPACES} spaces\n"
+    
+    # LED status
+    led_emoji = "💡" if leds_state == "ON" else "🌑"
+    led_text = "Activo" if leds_state == "ON" else "Desactivado"
+    message += f"\n{led_emoji} <b>Semáforo:</b> {led_text}"
     
     if last_update_time:
         message += f"\n🕐 <b>Last updated:</b> {last_update_time}"
@@ -403,6 +425,28 @@ def get_container_logs(container_name, num_lines):
         return False, f"Error: {str(e)}"
 
 
+def get_led_state():
+    """
+    Get the current LED state from the subscriber's state file
+    
+    Returns:
+        tuple: (leds_enabled: bool, success: bool)
+    """
+    try:
+        state_file = "/app/data/parking_state.json"
+        if os.path.exists(state_file):
+            with open(state_file, 'r') as f:
+                state = json.load(f)
+                leds_enabled = state.get('leds_enabled', True)
+                return leds_enabled, True
+        else:
+            # File doesn't exist yet, assume default ON
+            return True, True
+    except Exception as e:
+        logger.error(f"Error reading LED state: {e}")
+        return True, False  # Default to ON if error
+
+
 def get_updates(offset=None):
     """
     Get new messages from Telegram
@@ -448,6 +492,7 @@ def handle_message(message):
         response += "/parking - Ver estado actual del estacionamiento\n"
         response += "/status - Ver estado del sistema\n"
         response += "/set - Modificar el contador del estacionamiento\n"
+        response += "/leds - Controlar el semáforo (on/off)\n"
         response += "/logs - Ver logs de contenedores Docker\n"
         response += "/schedule - Configurar notificaciones programadas\n"
         response += "/listschedules - Ver tus notificaciones programadas\n"
@@ -460,6 +505,8 @@ def handle_message(message):
         response += "<b>/status</b> - Ver estado del sistema\n"
         response += "<b>/set &lt;número&gt;</b> - Establecer contador (0-35)\n"
         response += "  Ejemplo: /set 25\n"
+        response += "<b>/leds &lt;on|off&gt;</b> - Controlar semáforo\n"
+        response += "  Ejemplo: /leds off (para pruebas)\n"
         response += "<b>/logs &lt;contenedor&gt; &lt;líneas&gt;</b> - Ver logs\n"
         response += "  Ejemplo: /logs telegram-bot 50\n"
         response += "  Contenedores: mosquitto-broker, pi3-subscriber, webpanel, telegram-bot\n"
@@ -493,6 +540,9 @@ def handle_message(message):
     
     elif text.lower().startswith("/logs"):
         handle_logs_command(chat_id, text, user_name)
+    
+    elif text.lower().startswith("/leds"):
+        handle_leds_command(chat_id, text, user_name)
     
     else:
         response = "❓ Comando desconocido. Usa /help para ver los comandos disponibles."
@@ -751,6 +801,59 @@ def handle_logs_command(chat_id, text, user_name):
         send_message(chat_id, response)
 
 
+def handle_leds_command(chat_id, text, user_name):
+    """Handle /leds command to control semaforo LEDs"""
+    try:
+        parts = text.split()
+        
+        if len(parts) < 2:
+            response = "❌ <b>Formato incorrecto</b>\n\n"
+            response += "Uso: /leds &lt;on|off&gt;\n\n"
+            response += "<b>Ejemplos:</b>\n"
+            response += "• /leds on - Encender semáforo\n"
+            response += "• /leds off - Apagar semáforo\n\n"
+            response += "ℹ️ El contador seguirá funcionando incluso con LEDs apagados"
+            send_message(chat_id, response)
+            return
+        
+        command = parts[1].lower()
+        
+        if command not in ["on", "off"]:
+            response = "❌ Comando no válido. Usa: /leds on o /leds off"
+            send_message(chat_id, response)
+            return
+        
+        # Publish MQTT command
+        mqtt_command = "LEDOn" if command == "on" else "LEDOff"
+        
+        if publish_mqtt_command(mqtt_command):
+            if command == "on":
+                response = "✅ <b>Semáforo Encendido</b>\n\n"
+                response += "💡 Los LEDs están activos\n"
+                response += f"👤 Activado por: {user_name}\n"
+                response += f"🕐 {get_mexico_city_time()}\n\n"
+                response += "Los LEDs reflejarán el estado actual del estacionamiento"
+            else:
+                response = "✅ <b>Semáforo Apagado</b>\n\n"
+                response += "🌑 Los LEDs están desactivados\n"
+                response += f"👤 Desactivado por: {user_name}\n"
+                response += f"🕐 {get_mexico_city_time()}\n\n"
+                response += "⚠️ El contador seguirá funcionando normalmente\n"
+                response += "Ideal para pruebas sin mostrar datos al público"
+            
+            response += "\n📝 Este cambio ha sido registrado en Azure IoT Hub"
+            send_message(chat_id, response)
+            logger.info(f"LEDs {command} by {user_name} (chat_id: {chat_id})")
+        else:
+            response = "❌ Error al publicar el comando MQTT. Intenta de nuevo."
+            send_message(chat_id, response)
+            
+    except Exception as e:
+        logger.error(f"Error in handle_leds_command: {e}")
+        response = "❌ Error al procesar el comando."
+        send_message(chat_id, response)
+
+
 def run_bot():
     """
     Main bot loop - continuously poll for new messages
@@ -795,7 +898,7 @@ def main():
         init_scheduler()
         
         # Initialize MQTT listener
-        mqtt_listener = MQTTListener(MQTT_BROKER, MQTT_PORT, TOTAL_TOPIC)
+        mqtt_listener = MQTTListener(MQTT_BROKER, MQTT_PORT, TOTAL_TOPIC, LED_STATE_TOPIC)
         
         # Start MQTT connection in a separate thread
         logger.info("Starting MQTT listener...")

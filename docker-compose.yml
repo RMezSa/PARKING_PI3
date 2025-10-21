@@ -25,6 +25,7 @@ services:
       - /proc:/proc
       - ./subscriber.py:/app/subscriber.py
       - ./iot_hub_client.py:/app/iot_hub_client.py
+      - ./subscriber_data:/app/data
     depends_on:
       - mosquitto-broker
     environment:

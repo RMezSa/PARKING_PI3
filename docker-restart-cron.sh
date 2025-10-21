@@ -51,9 +51,14 @@ case "$1" in
         turn_off_semaforo
         ;;
     up)
-        log_message "Starting docker compose up..."
+        log_message "Starting docker compose up (4:30 AM daily startup)..."
+        
+        # Reset counter in the state file before starting containers
+        log_message "Resetting parking counter to 0 for new day..."
+        python3 "${COMPOSE_DIR}/reset_counter_host.py" 2>&1 | tee -a "$LOG_FILE"
+        
         sudo docker compose up -d 2>&1 | tee -a "$LOG_FILE"
-        log_message "Docker compose up completed."
+        log_message "Docker compose up completed. Counter reset to 0, LED state preserved."
         ;;
     *)
         log_message "ERROR: Invalid argument. Use 'down' or 'up'"
