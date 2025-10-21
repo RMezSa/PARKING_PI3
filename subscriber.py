@@ -66,31 +66,47 @@ def publicar_total_periodicamente():
 def on_message(client, userdata, msg):
     global total
     try:
-        payload = msg.payload.decode().strip().lower()
+        payload = msg.payload.decode().strip()
+        payload_lower = payload.lower()
         event_type = None
 
         with total_lock:
-            if "entry" in payload:
+            if "entry" in payload_lower:
                 total += 1
                 event_type = "entry"
                 print(f"Entry → Total: {total}")
 
-            elif payload == "exit":
+            elif payload_lower == "exit":
                 total -= 1
                 if total < 0:
                     total = 0
                 event_type = "exit"
                 print(f"Exit → Total: {total}")
 
-            elif payload == "reset":
+            elif payload_lower == "reset":
                 total = 0
                 event_type = "reset"
                 print("Reset → Total: 0")
 
-            elif payload == "setfull":
+            elif payload_lower == "setfull":
                 total = 35
                 event_type = "setfull"
                 print("SetFull → Total: 35")
+
+            elif payload_lower.startswith("setvalue:"):
+                try:
+                    # Extract the number from "SetValue:XX"
+                    new_value = int(payload.split(":", 1)[1].strip())
+                    if 0 <= new_value <= 35:
+                        total = new_value
+                        event_type = "setvalue"
+                        print(f"SetValue → Total: {total} (via Telegram Bot)")
+                    else:
+                        print(f"SetValue rejected: {new_value} out of range (0-35)")
+                        return
+                except (ValueError, IndexError) as e:
+                    print(f"Invalid SetValue format: {payload}")
+                    return
 
             else:
                 print(repr(payload))

@@ -57,3 +57,5 @@ services:
       - MQTT_PORT=${MQTT_PORT:-1883}
     volumes:
       - ./telegram_bot/data:/app/data
+      - ./get_docker_logs.sh:/host/get_docker_logs.sh:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro

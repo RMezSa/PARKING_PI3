@@ -10,7 +10,9 @@ import time
 import logging
 import os
 import json
+import subprocess
 import paho.mqtt.client as mqtt
+import paho.mqtt.publish as publish_mqtt
 from datetime import datetime
 import pytz
 import threading
@@ -27,7 +29,9 @@ POLLING_INTERVAL = 2  # seconds between polling
 MQTT_BROKER = os.environ.get("MQTT_BROKER", "mosquitto-broker")
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
 TOTAL_TOPIC = "estacionamiento/total"
+COMMAND_TOPIC = "deepstream/car_count"
 MAX_PARKING_SPACES = 35  # Total capacity
+LOGS_SCRIPT_PATH = "/host/get_docker_logs.sh"
 
 # Validate required environment variables
 if not BOT_TOKEN:
@@ -344,6 +348,61 @@ def send_message(chat_id, text):
         return None
 
 
+def publish_mqtt_command(command):
+    """
+    Publish a command to the MQTT broker
+    
+    Args:
+        command (str): Command to publish (e.g., "SetValue:25")
+    
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        publish_mqtt.single(
+            COMMAND_TOPIC,
+            command,
+            hostname=MQTT_BROKER,
+            port=MQTT_PORT
+        )
+        logger.info(f"Published MQTT command: {command}")
+        return True
+    except Exception as e:
+        logger.error(f"Error publishing MQTT command: {e}")
+        return False
+
+
+def get_container_logs(container_name, num_lines):
+    """
+    Get logs from a Docker container using the host script
+    
+    Args:
+        container_name (str): Name of the container
+        num_lines (int): Number of lines to retrieve
+    
+    Returns:
+        tuple: (success: bool, output: str)
+    """
+    try:
+        result = subprocess.run(
+            [LOGS_SCRIPT_PATH, container_name, str(num_lines)],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        
+        if result.returncode == 0:
+            return True, result.stdout
+        else:
+            return False, result.stdout or result.stderr
+            
+    except subprocess.TimeoutExpired:
+        return False, "Error: Command timed out"
+    except Exception as e:
+        logger.error(f"Error getting container logs: {e}")
+        return False, f"Error: {str(e)}"
+
+
 def get_updates(offset=None):
     """
     Get new messages from Telegram
@@ -388,6 +447,8 @@ def handle_message(message):
         response += "Usa los siguientes comandos:\n"
         response += "/parking - Ver estado actual del estacionamiento\n"
         response += "/status - Ver estado del sistema\n"
+        response += "/set - Modificar el contador del estacionamiento\n"
+        response += "/logs - Ver logs de contenedores Docker\n"
         response += "/schedule - Configurar notificaciones programadas\n"
         response += "/listschedules - Ver tus notificaciones programadas\n"
         response += "/help - Mostrar este mensaje de ayuda"
@@ -397,6 +458,11 @@ def handle_message(message):
         response = "🅿️ <b>Ayuda del Bot de Estacionamiento</b>\n\n"
         response += "<b>/parking</b> - Obtener disponibilidad actual\n"
         response += "<b>/status</b> - Ver estado del sistema\n"
+        response += "<b>/set &lt;número&gt;</b> - Establecer contador (0-35)\n"
+        response += "  Ejemplo: /set 25\n"
+        response += "<b>/logs &lt;contenedor&gt; &lt;líneas&gt;</b> - Ver logs\n"
+        response += "  Ejemplo: /logs telegram-bot 50\n"
+        response += "  Contenedores: mosquitto-broker, pi3-subscriber, webpanel, telegram-bot\n"
         response += "<b>/schedule</b> - Configurar notificaciones programadas\n"
         response += "  Ejemplo: /schedule lunes 15:30\n"
         response += "  Ejemplo: /schedule diario 9:00\n"
@@ -421,6 +487,12 @@ def handle_message(message):
     
     elif text.lower().startswith("/removeschedule"):
         handle_remove_schedule_command(chat_id, text)
+    
+    elif text.lower().startswith("/set"):
+        handle_set_command(chat_id, text, user_name)
+    
+    elif text.lower().startswith("/logs"):
+        handle_logs_command(chat_id, text, user_name)
     
     else:
         response = "❓ Comando desconocido. Usa /help para ver los comandos disponibles."
@@ -551,6 +623,131 @@ def handle_remove_schedule_command(chat_id, text):
     except Exception as e:
         logger.error(f"Error in handle_remove_schedule_command: {e}")
         response = "❌ Error al eliminar la notificación."
+        send_message(chat_id, response)
+
+
+def handle_set_command(chat_id, text, user_name):
+    """Handle /set command to change parking counter"""
+    try:
+        parts = text.split()
+        
+        if len(parts) < 2:
+            response = "❌ <b>Formato incorrecto</b>\n\n"
+            response += "Uso: /set &lt;número&gt;\n\n"
+            response += "<b>Ejemplos:</b>\n"
+            response += "• /set 0 - Establecer contador a 0\n"
+            response += "• /set 25 - Establecer contador a 25\n"
+            response += "• /set 35 - Establecer contador a 35 (full)\n\n"
+            response += "⚠️ El valor debe estar entre 0 y 35"
+            send_message(chat_id, response)
+            return
+        
+        try:
+            new_value = int(parts[1])
+            
+            if not (0 <= new_value <= MAX_PARKING_SPACES):
+                response = f"❌ Valor fuera de rango. Debe estar entre 0 y {MAX_PARKING_SPACES}"
+                send_message(chat_id, response)
+                return
+            
+            # Publish MQTT command
+            command = f"SetValue:{new_value}"
+            if publish_mqtt_command(command):
+                response = f"✅ <b>Contador actualizado</b>\n\n"
+                response += f"📊 Nuevo valor: {new_value}/{MAX_PARKING_SPACES}\n"
+                response += f"👤 Modificado por: {user_name}\n"
+                response += f"🕐 {get_mexico_city_time()}\n\n"
+                response += "⚠️ Este cambio ha sido registrado en Azure IoT Hub"
+                send_message(chat_id, response)
+                logger.info(f"Counter set to {new_value} by {user_name} (chat_id: {chat_id})")
+            else:
+                response = "❌ Error al publicar el comando MQTT. Intenta de nuevo."
+                send_message(chat_id, response)
+                
+        except ValueError:
+            response = "❌ Valor no válido. Debe ser un número entero entre 0 y 35"
+            send_message(chat_id, response)
+            
+    except Exception as e:
+        logger.error(f"Error in handle_set_command: {e}")
+        response = "❌ Error al procesar el comando."
+        send_message(chat_id, response)
+
+
+def handle_logs_command(chat_id, text, user_name):
+    """Handle /logs command to fetch Docker container logs"""
+    try:
+        parts = text.split()
+        
+        if len(parts) < 2:
+            response = "❌ <b>Formato incorrecto</b>\n\n"
+            response += "Uso: /logs &lt;contenedor&gt; [líneas]\n\n"
+            response += "<b>Contenedores disponibles:</b>\n"
+            response += "• mosquitto-broker\n"
+            response += "• pi3-subscriber\n"
+            response += "• webpanel\n"
+            response += "• telegram-bot\n\n"
+            response += "<b>Ejemplos:</b>\n"
+            response += "• /logs telegram-bot 25 (últimas 25 líneas)\n"
+            response += "• /logs pi3-subscriber 50\n"
+            response += "• /logs webpanel (últimas 25 líneas por defecto)"
+            send_message(chat_id, response)
+            return
+        
+        container_name = parts[1]
+        num_lines = int(parts[2]) if len(parts) > 2 else 25
+        
+        # Validate number of lines
+        if not (1 <= num_lines <= 200):
+            response = "❌ Número de líneas debe estar entre 1 y 200"
+            send_message(chat_id, response)
+            return
+        
+        # Valid containers
+        valid_containers = ["mosquitto-broker", "pi3-subscriber", "webpanel", "telegram-bot"]
+        if container_name not in valid_containers:
+            response = f"❌ Contenedor no válido: {container_name}\n\n"
+            response += "Contenedores válidos:\n"
+            response += "\n".join(f"• {c}" for c in valid_containers)
+            send_message(chat_id, response)
+            return
+        
+        # Send "processing" message
+        send_message(chat_id, f"⏳ Obteniendo últimas {num_lines} líneas de <b>{container_name}</b>...")
+        
+        # Get logs
+        success, output = get_container_logs(container_name, num_lines)
+        
+        if success:
+            # Split output into chunks if too long (Telegram has a 4096 character limit)
+            max_length = 4000
+            if len(output) <= max_length:
+                response = f"📋 <b>Logs de {container_name}</b>\n\n"
+                response += f"<pre>{output}</pre>"
+                send_message(chat_id, response)
+            else:
+                # Split into multiple messages
+                chunks = [output[i:i+max_length] for i in range(0, len(output), max_length)]
+                for i, chunk in enumerate(chunks):
+                    if i == 0:
+                        response = f"📋 <b>Logs de {container_name}</b> (parte {i+1}/{len(chunks)})\n\n"
+                    else:
+                        response = f"📋 <b>Parte {i+1}/{len(chunks)}</b>\n\n"
+                    response += f"<pre>{chunk}</pre>"
+                    send_message(chat_id, response)
+                    time.sleep(0.5)  # Small delay between messages
+            
+            logger.info(f"Logs fetched for {container_name} by {user_name} (chat_id: {chat_id})")
+        else:
+            response = f"❌ Error al obtener logs:\n\n<pre>{output}</pre>"
+            send_message(chat_id, response)
+            
+    except ValueError:
+        response = "❌ Número de líneas no válido. Debe ser un entero entre 1 y 200"
+        send_message(chat_id, response)
+    except Exception as e:
+        logger.error(f"Error in handle_logs_command: {e}")
+        response = "❌ Error al procesar el comando."
         send_message(chat_id, response)
 
 
