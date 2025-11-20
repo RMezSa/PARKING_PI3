@@ -1,0 +1,40 @@
+{
+  "fcc543f3220e99096c4402ce5fb207ed457ad45b837db87435abf7a2e2e6c313": {
+    "chat_id": "7155603363",
+    "phone": "5611930911",
+    "role": "admin",
+    "registered_at": "23/10/2025 15:18:16",
+    "notifications_enabled": true,
+    "last_report_time": null,
+    "pending_activation": false,
+    "activated_at": "23/10/2025 15:23:46"
+  },
+  "862eec3c166f9733871ea7b148a438969e91f3c8dd551814ca94f5a387e39f02": {
+    "chat_id": "8133633490",
+    "phone": "5547822222",
+    "role": "admin",
+    "registered_at": "23/10/2025 15:27:00",
+    "notifications_enabled": true,
+    "last_report_time": null,
+    "promoted_at": "23/10/2025 15:34:07",
+    "promoted_by": "7155603363"
+  },
+  "2201e2ecc7b137d242a0744e2d92818bad779fb2d96e2956d126f3efad0e684f": {
+    "chat_id": "6824848779",
+    "phone": "5530526122",
+    "role": "admin",
+    "registered_at": "23/10/2025 16:16:49",
+    "notifications_enabled": true,
+    "last_report_time": null,
+    "promoted_at": "23/10/2025 18:31:57",
+    "promoted_by": "7155603363"
+  },
+  "d8d646b1486b40a1ede76d2bd71a82136f7a130b73e1f665aa5a92d880366340": {
+    "chat_id": "1157108199",
+    "phone": "5523207101",
+    "role": "user",
+    "registered_at": "23/10/2025 18:42:00",
+    "notifications_enabled": false,
+    "last_report_time": "23/10/2025 18:42:25"
+  }
+}

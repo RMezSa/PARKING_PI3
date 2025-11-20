@@ -1,0 +1,19 @@
+[Unit]
+Description=GPIO5 Persistent Manager Service
+After=network.target
+Documentation=https://github.com/RMezSa/PARKING_PI3
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/gpio5_manager.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -13,9 +13,12 @@ import json
 import subprocess
 import paho.mqtt.client as mqtt
 import paho.mqtt.publish as publish_mqtt
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 import threading
+import hashlib
+import secrets
+import re
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -33,6 +36,18 @@ LED_STATE_TOPIC = "estacionamiento/leds_state"
 COMMAND_TOPIC = "deepstream/car_count"
 MAX_PARKING_SPACES = 35  # Total capacity
 LOGS_SCRIPT_PATH = "/host/get_docker_logs.sh"
+
+# Authentication Configuration
+INITIAL_ADMIN_PHONE = "5611930911"  # First admin phone number
+ADMIN_REGISTRATION_CODE = os.environ.get("ADMIN_REG_CODE", "ADMIN2024PARK")
+USER_REGISTRATION_CODE = os.environ.get("USER_REG_CODE", "USER2024PARK")
+REPORT_COOLDOWN_MINUTES = 5  # Cooldown for reporting wrong count
+VERIFICATION_CODE_TIMEOUT = 300  # 5 minutes timeout for verification codes
+REGISTRATION_TIMEOUT = 600  # 10 minutes timeout for pending registrations
+
+# Data files
+schedules_file = "/app/data/schedules.json"
+users_file = "/app/data/users.json"
 
 # Validate required environment variables
 if not BOT_TOKEN:
@@ -52,6 +67,10 @@ last_update_time = None
 mqtt_connected = False
 scheduler = None
 schedules_file = "/app/data/schedules.json"
+
+# Authentication state
+pending_verifications = {}  # {chat_id: {code, phone, role, expires_at}}
+pending_registrations = {}  # {chat_id: {phone, role, awaiting_code}}
 
 # Day mapping for Spanish
 DAY_MAPPING = {
@@ -83,6 +102,304 @@ def get_mexico_city_time():
     utc_now = datetime.utcnow().replace(tzinfo=pytz.utc)
     mexico_time = utc_now.astimezone(mexico_tz)
     return mexico_time.strftime("%d/%m/%Y %H:%M:%S")
+
+
+# ==================== USER AUTHENTICATION FUNCTIONS ====================
+
+def hash_phone(phone):
+    """Hash phone number using SHA256"""
+    return hashlib.sha256(phone.encode()).hexdigest()
+
+
+def validate_mexican_phone(phone):
+    """
+    Validate Mexican phone number format
+    Accepts 10 digits OR 12 digits with +52 country code
+    
+    Args:
+        phone (str): Phone number to validate
+        
+    Returns:
+        tuple: (is_valid: bool, cleaned_phone: str - always 10 digits)
+    """
+    # Remove all non-digit characters
+    cleaned = re.sub(r'\D', '', phone)
+    
+    # If 12 digits and starts with 52, remove the country code
+    if len(cleaned) == 12 and cleaned.startswith('52'):
+        cleaned = cleaned[2:]  # Remove the '52' prefix
+    
+    # Must be exactly 10 digits after processing
+    if len(cleaned) == 10 and cleaned.isdigit():
+        return True, cleaned
+    
+    return False, ""
+
+
+def load_users():
+    """Load users from JSON file"""
+    try:
+        if os.path.exists(users_file):
+            with open(users_file, 'r') as f:
+                return json.load(f)
+        return {}
+    except Exception as e:
+        logger.error(f"Error loading users: {e}")
+        return {}
+
+
+def save_users(users):
+    """Save users to JSON file"""
+    try:
+        os.makedirs(os.path.dirname(users_file), exist_ok=True)
+        with open(users_file, 'w') as f:
+            json.dump(users, f, indent=2)
+        logger.info("Users saved successfully")
+    except Exception as e:
+        logger.error(f"Error saving users: {e}")
+
+
+def get_user_by_chat_id(chat_id):
+    """
+    Get user by chat_id
+    
+    Returns:
+        dict or None: User data if found
+    """
+    users = load_users()
+    chat_id_str = str(chat_id)
+    
+    for phone_hash, user_data in users.items():
+        if user_data.get('chat_id') == chat_id_str:
+            return user_data
+    
+    return None
+
+
+def get_user_by_phone(phone):
+    """
+    Get user by phone number (checks hashed version)
+    
+    Returns:
+        tuple: (user_data: dict or None, phone_hash: str)
+    """
+    users = load_users()
+    phone_hash = hash_phone(phone)
+    
+    if phone_hash in users:
+        return users[phone_hash], phone_hash
+    
+    return None, phone_hash
+
+
+def is_authenticated(chat_id):
+    """Check if user is authenticated"""
+    return get_user_by_chat_id(chat_id) is not None
+
+
+def cleanup_expired_registrations():
+    """
+    Remove expired pending registrations and verifications
+    Should be called before processing registration attempts
+    """
+    current_time = datetime.now()
+    
+    # Clean up expired pending registrations
+    expired_registrations = []
+    for chat_id, data in pending_registrations.items():
+        started_at = data.get('started_at')
+        if started_at and (current_time - started_at).total_seconds() > REGISTRATION_TIMEOUT:
+            expired_registrations.append(chat_id)
+    
+    for chat_id in expired_registrations:
+        del pending_registrations[chat_id]
+        logger.info(f"Cleaned up expired registration for chat_id={chat_id}")
+    
+    # Clean up expired pending verifications
+    expired_verifications = []
+    for chat_id, data in pending_verifications.items():
+        expires_at = data.get('expires_at')
+        if expires_at and current_time > expires_at:
+            expired_verifications.append(chat_id)
+    
+    for chat_id in expired_verifications:
+        del pending_verifications[chat_id]
+        logger.info(f"Cleaned up expired verification for chat_id={chat_id}")
+
+
+def is_admin(chat_id):
+    """Check if user is an admin"""
+    user = get_user_by_chat_id(chat_id)
+    return user is not None and user.get('role') == 'admin'
+
+
+def register_user(chat_id, phone, role='user'):
+    """
+    Register a new user
+    
+    Args:
+        chat_id: Telegram chat ID
+        phone: Phone number (will be hashed)
+        role: 'admin' or 'user'
+        
+    Returns:
+        tuple: (success: bool, message: str)
+    """
+    users = load_users()
+    phone_hash = hash_phone(phone)
+    chat_id_str = str(chat_id)
+    
+    # Check if phone already exists
+    if phone_hash in users:
+        existing_user = users[phone_hash]
+        existing_chat_id = existing_user.get('chat_id')
+        
+        # Check if this is pending activation (initial admin with no chat_id)
+        if existing_chat_id is None and existing_user.get('pending_activation', False):
+            # Activate the pending account
+            users[phone_hash]['chat_id'] = chat_id_str
+            users[phone_hash]['activated_at'] = get_mexico_city_time()
+            users[phone_hash]['pending_activation'] = False
+            save_users(users)
+            logger.info(f"Pending {existing_user['role']} activated: phone_hash={phone_hash[:8]}..., chat_id={chat_id}")
+            return True, "Cuenta activada exitosamente"
+        
+        # Same user, same chat_id - already registered
+        if existing_chat_id == chat_id_str:
+            return False, "Ya estás registrado"
+        
+        # Different chat_id - potential duplicate/account takeover
+        return False, "DUPLICATE_PHONE"
+    
+    # Check if chat_id is already associated with another phone
+    for _, user_data in users.items():
+        if user_data.get('chat_id') == chat_id_str:
+            return False, "Este chat ya está asociado con otro número de teléfono"
+    
+    # Create new user
+    users[phone_hash] = {
+        'chat_id': chat_id_str,
+        'phone': phone,  # Store plain for reference (you can remove if paranoid)
+        'role': role,
+        'registered_at': get_mexico_city_time(),
+        'notifications_enabled': True if role == 'admin' else False,
+        'last_report_time': None
+    }
+    
+    save_users(users)
+    logger.info(f"New {role} registered: phone_hash={phone_hash[:8]}..., chat_id={chat_id}")
+    
+    return True, "Registro exitoso"
+
+
+def update_user_notifications(chat_id, enabled):
+    """Update admin notification preferences"""
+    users = load_users()
+    chat_id_str = str(chat_id)
+    
+    for phone_hash, user_data in users.items():
+        if user_data.get('chat_id') == chat_id_str:
+            users[phone_hash]['notifications_enabled'] = enabled
+            save_users(users)
+            return True
+    
+    return False
+
+
+def can_report(chat_id):
+    """
+    Check if user can report (5 minute cooldown)
+    
+    Returns:
+        tuple: (can_report: bool, minutes_remaining: int)
+    """
+    users = load_users()
+    chat_id_str = str(chat_id)
+    
+    for phone_hash, user_data in users.items():
+        if user_data.get('chat_id') == chat_id_str:
+            last_report = user_data.get('last_report_time')
+            
+            if not last_report:
+                return True, 0
+            
+            # Parse last report time
+            try:
+                mexico_tz = pytz.timezone('America/Mexico_City')
+                last_time = datetime.strptime(last_report, "%d/%m/%Y %H:%M:%S")
+                last_time = mexico_tz.localize(last_time)
+                
+                now = datetime.now(mexico_tz)
+                time_diff = now - last_time
+                minutes_passed = time_diff.total_seconds() / 60
+                
+                if minutes_passed >= REPORT_COOLDOWN_MINUTES:
+                    return True, 0
+                else:
+                    minutes_remaining = int(REPORT_COOLDOWN_MINUTES - minutes_passed) + 1
+                    return False, minutes_remaining
+                    
+            except Exception as e:
+                logger.error(f"Error parsing report time: {e}")
+                return True, 0
+    
+    return False, 0
+
+
+def update_last_report_time(chat_id):
+    """Update the last report time for a user"""
+    users = load_users()
+    chat_id_str = str(chat_id)
+    
+    for phone_hash, user_data in users.items():
+        if user_data.get('chat_id') == chat_id_str:
+            users[phone_hash]['last_report_time'] = get_mexico_city_time()
+            save_users(users)
+            return True
+    
+    return False
+
+
+def get_admins_with_notifications():
+    """Get list of admin chat_ids with notifications enabled"""
+    users = load_users()
+    admins = []
+    
+    for phone_hash, user_data in users.items():
+        if user_data.get('role') == 'admin' and user_data.get('notifications_enabled', False):
+            admins.append(user_data.get('chat_id'))
+    
+    return admins
+
+
+def generate_verification_code():
+    """Generate a 6-digit verification code"""
+    return ''.join([str(secrets.randbelow(10)) for _ in range(6)])
+
+
+def initialize_first_admin():
+    """Initialize the first admin if no users exist"""
+    users = load_users()
+    
+    if not users:
+        logger.info("No users found, creating initial admin...")
+        phone_hash = hash_phone(INITIAL_ADMIN_PHONE)
+        
+        users[phone_hash] = {
+            'chat_id': None,  # Will be set when admin registers
+            'phone': INITIAL_ADMIN_PHONE,
+            'role': 'admin',
+            'registered_at': get_mexico_city_time(),
+            'notifications_enabled': True,
+            'last_report_time': None,
+            'pending_activation': True
+        }
+        
+        save_users(users)
+        logger.info(f"Initial admin created with phone: {INITIAL_ADMIN_PHONE}")
+
+
+# ==================== END USER AUTHENTICATION FUNCTIONS ====================
 
 
 def load_schedules():
@@ -480,46 +797,73 @@ def handle_message(message):
         message (dict): Message object from Telegram
     """
     chat_id = message["chat"]["id"]
-    text = message.get("text", "").strip()
     user_name = message["from"].get("first_name", "User")
     
+    # Handle contact sharing (phone number registration)
+    if "contact" in message:
+        handle_contact_registration(message)
+        return
+    
+    text = message.get("text", "").strip()
     logger.info(f"Received message from {user_name} (chat_id: {chat_id}): {text}")
     
-    # Handle different commands
-    if text.lower() == "/start":
-        response = f"👋 ¡Hola {user_name}! Bienvenido al Bot de Estacionamiento.\n\n"
-        response += "Usa los siguientes comandos:\n"
-        response += "/parking - Ver estado actual del estacionamiento\n"
-        response += "/status - Ver estado del sistema\n"
-        response += "/set - Modificar el contador del estacionamiento\n"
-        response += "/leds - Controlar el semáforo (on/off)\n"
-        response += "/logs - Ver logs de contenedores Docker\n"
-        response += "/schedule - Configurar notificaciones programadas\n"
-        response += "/listschedules - Ver tus notificaciones programadas\n"
-        response += "/help - Mostrar este mensaje de ayuda"
-        send_message(chat_id, response)
+    # Check if user is in verification process
+    if chat_id in pending_verifications:
+        # Allow cancel during verification
+        if text.lower() == "/cancel":
+            del pending_verifications[chat_id]
+            response = "❌ <b>Verificación Cancelada</b>\n\n"
+            response += "Proceso de verificación cancelado.\n\n"
+            response += "Usa /register para comenzar de nuevo."
+            send_message(chat_id, response)
+            logger.info(f"Verification cancelled by user: chat_id={chat_id}")
+            return
+        
+        handle_verification_code(chat_id, text)
+        return
     
-    elif text.lower() == "/help":
-        response = "🅿️ <b>Ayuda del Bot de Estacionamiento</b>\n\n"
-        response += "<b>/parking</b> - Obtener disponibilidad actual\n"
-        response += "<b>/status</b> - Ver estado del sistema\n"
-        response += "<b>/set &lt;número&gt;</b> - Establecer contador (0-35)\n"
-        response += "  Ejemplo: /set 25\n"
-        response += "<b>/leds &lt;on|off&gt;</b> - Controlar semáforo\n"
-        response += "  Ejemplo: /leds off (para pruebas)\n"
-        response += "<b>/logs &lt;contenedor&gt; &lt;líneas&gt;</b> - Ver logs\n"
-        response += "  Ejemplo: /logs telegram-bot 50\n"
-        response += "  Contenedores: mosquitto-broker, pi3-subscriber, webpanel, telegram-bot\n"
-        response += "<b>/schedule</b> - Configurar notificaciones programadas\n"
-        response += "  Ejemplo: /schedule lunes 15:30\n"
-        response += "  Ejemplo: /schedule diario 9:00\n"
-        response += "<b>/listschedules</b> - Ver tus notificaciones\n"
-        response += "<b>/removeschedule</b> - Eliminar notificación\n"
-        response += "  Ejemplo: /removeschedule 1\n"
-        response += "<b>/start</b> - Mostrar mensaje de bienvenida\n\n"
-        response += "📅 <b>Días válidos:</b> lunes, martes, miércoles, jueves, viernes, sábado, domingo, diario\n"
-        response += "🕐 <b>Formato de hora:</b> HH:MM (horario CDMX)"
+    # Check if user is in registration process (awaiting registration code)
+    if chat_id in pending_registrations:
+        # Allow cancel during registration
+        if text.lower() == "/cancel":
+            del pending_registrations[chat_id]
+            response = "❌ <b>Registro Cancelado</b>\n\n"
+            response += "Proceso de registro cancelado.\n\n"
+            response += "Usa /register para comenzar de nuevo."
+            send_message(chat_id, response)
+            logger.info(f"Registration cancelled by user: chat_id={chat_id}")
+            return
+        
+        handle_registration_code(chat_id, text)
+        return
+    
+    # Public commands (no authentication required)
+    if text.lower() == "/start":
+        handle_start_command(chat_id, user_name)
+        return
+    
+    if text.lower().startswith("/register"):
+        handle_register_command(chat_id, text, user_name)
+        return
+    
+    if text.lower() == "/cancel":
+        # Nothing to cancel
+        response = "ℹ️ No hay ningún proceso activo que cancelar.\n\n"
+        response += "Usa /help para ver los comandos disponibles."
         send_message(chat_id, response)
+        return
+    
+    # Check authentication for all other commands
+    if not is_authenticated(chat_id):
+        response = "🔒 <b>Acceso no autorizado</b>\n\n"
+        response += "Debes registrarte primero para usar este bot.\n\n"
+        response += "Usa el comando /register para comenzar el proceso de registro."
+        send_message(chat_id, response)
+        return
+    
+    # Authenticated user commands
+    if text.lower() == "/help":
+        handle_help_command(chat_id)
     
     elif text.lower() in ["/parking", "parking", "/status", "status"]:
         # Fetch and send parking data
@@ -535,17 +879,595 @@ def handle_message(message):
     elif text.lower().startswith("/removeschedule"):
         handle_remove_schedule_command(chat_id, text)
     
+    elif text.lower().startswith("/report"):
+        handle_report_command(chat_id, text, user_name)
+    
+    # Admin-only commands
     elif text.lower().startswith("/set"):
-        handle_set_command(chat_id, text, user_name)
+        if is_admin(chat_id):
+            handle_set_command(chat_id, text, user_name)
+        else:
+            send_message(chat_id, "❌ Este comando solo está disponible para administradores.")
     
     elif text.lower().startswith("/logs"):
-        handle_logs_command(chat_id, text, user_name)
+        if is_admin(chat_id):
+            handle_logs_command(chat_id, text, user_name)
+        else:
+            send_message(chat_id, "❌ Este comando solo está disponible para administradores.")
     
     elif text.lower().startswith("/leds"):
-        handle_leds_command(chat_id, text, user_name)
+        if is_admin(chat_id):
+            handle_leds_command(chat_id, text, user_name)
+        else:
+            send_message(chat_id, "❌ Este comando solo está disponible para administradores.")
+    
+    elif text.lower().startswith("/addadmin"):
+        if is_admin(chat_id):
+            handle_addadmin_command(chat_id, text, user_name)
+        else:
+            send_message(chat_id, "❌ Este comando solo está disponible para administradores.")
+    
+    elif text.lower().startswith("/notifications"):
+        if is_admin(chat_id):
+            handle_notifications_command(chat_id, text)
+        else:
+            send_message(chat_id, "❌ Este comando solo está disponible para administradores.")
     
     else:
         response = "❓ Comando desconocido. Usa /help para ver los comandos disponibles."
+        send_message(chat_id, response)
+
+
+def handle_start_command(chat_id, user_name):
+    """Handle /start command"""
+    response = f"👋 ¡Hola {user_name}! Bienvenido al Bot de Estacionamiento.\n\n"
+    
+    if is_authenticated(chat_id):
+        user = get_user_by_chat_id(chat_id)
+        role_text = "Administrador" if user.get('role') == 'admin' else "Usuario"
+        response += f"🎫 Estado: <b>Autenticado</b> ({role_text})\n\n"
+        response += "Usa /help para ver los comandos disponibles."
+    else:
+        response += "🔒 <b>No estás registrado</b>\n\n"
+        response += "Para usar este bot necesitas registrarte primero.\n\n"
+        response += "<b>Comandos disponibles:</b>\n"
+        response += "/register &lt;código&gt; - Comenzar registro\n"
+        response += "/cancel - Cancelar registro en progreso"
+    
+    send_message(chat_id, response)
+
+
+def handle_help_command(chat_id):
+    """Handle /help command with role-based content"""
+    user = get_user_by_chat_id(chat_id)
+    
+    if user.get('role') == 'admin':
+        response = "🅿️ <b>Ayuda del Bot de Estacionamiento (ADMIN)</b>\n\n"
+        response += "<b>📊 Comandos de Consulta:</b>\n"
+        response += "/parking - Obtener disponibilidad actual\n"
+        response += "/status - Ver estado del sistema\n\n"
+        response += "<b>🔧 Comandos de Administrador:</b>\n"
+        response += "/set &lt;número&gt; - Establecer contador (0-35)\n"
+        response += "/leds &lt;on|off&gt; - Controlar semáforo\n"
+        response += "/logs &lt;contenedor&gt; &lt;líneas&gt; - Ver logs\n"
+        response += "/addadmin &lt;teléfono&gt; - Promover usuario a admin\n"
+        response += "/notifications &lt;on|off&gt; - Recibir reportes\n\n"
+        response += "<b>📅 Notificaciones Programadas:</b>\n"
+        response += "/schedule &lt;día&gt; &lt;hora&gt; - Configurar notificación\n"
+        response += "/listschedules - Ver notificaciones\n"
+        response += "/removeschedule &lt;#&gt; - Eliminar notificación\n\n"
+        response += "<b>🚨 Reportes:</b>\n"
+        response += "/report &lt;número&gt; - Reportar conteo incorrecto"
+    else:
+        response = "🅿️ <b>Ayuda del Bot de Estacionamiento</b>\n\n"
+        response += "<b>📊 Comandos de Consulta:</b>\n"
+        response += "/parking - Obtener disponibilidad actual\n"
+        response += "/status - Ver estado del sistema\n\n"
+        response += "<b>📅 Notificaciones Programadas:</b>\n"
+        response += "/schedule &lt;día&gt; &lt;hora&gt; - Configurar notificación\n"
+        response += "  Ejemplo: /schedule lunes 15:30\n"
+        response += "/listschedules - Ver tus notificaciones\n"
+        response += "/removeschedule &lt;#&gt; - Eliminar notificación\n\n"
+        response += "<b>🚨 Reportar Problema:</b>\n"
+        response += "/report &lt;número&gt; - Reportar conteo incorrecto\n"
+        response += "  Ejemplo: /report 20\n"
+        response += "  (Solo cada 5 minutos)\n\n"
+        response += "📅 <b>Días válidos:</b> lunes, martes, miércoles, jueves, viernes, sábado, domingo, diario\n"
+        response += "🕐 <b>Formato de hora:</b> HH:MM (horario CDMX)"
+    
+    send_message(chat_id, response)
+
+
+def handle_register_command(chat_id, text, user_name):
+    """Handle /register command"""
+    # Clean up any expired registrations first
+    cleanup_expired_registrations()
+    
+    # Check if already fully registered
+    if is_authenticated(chat_id):
+        response = "✅ Ya estás registrado en el sistema.\n\nUsa /help para ver los comandos disponibles."
+        send_message(chat_id, response)
+        return
+    
+    # Check if user is stuck in pending registration
+    if chat_id in pending_registrations:
+        # Allow restart if they provide a code again
+        parts = text.split()
+        if len(parts) >= 2:
+            # User is providing code again - clean up old pending state
+            logger.info(f"User {chat_id} restarting registration (was stuck in pending)")
+            del pending_registrations[chat_id]
+        else:
+            # Just remind them to share phone
+            response = "⚠️ <b>Registro Pendiente</b>\n\n"
+            response += "Ya iniciaste el proceso de registro.\n\n"
+            response += "Por favor comparte tu número de teléfono usando el botón, o usa:\n"
+            response += "• /cancel - Para cancelar y empezar de nuevo\n"
+            response += "• /register &lt;código&gt; - Para reintentar con el código"
+            send_message(chat_id, response)
+            return
+    
+    parts = text.split()
+    
+    if len(parts) < 2:
+        response = "🔐 <b>Registro de Usuario</b>\n\n"
+        response += "Para registrarte necesitas un <b>código de registro</b>.\n\n"
+        response += "<b>Uso:</b>\n"
+        response += "/register &lt;código&gt;\n\n"
+        response += "📝 Solicita tu código al administrador del sistema."
+        send_message(chat_id, response)
+        return
+    
+    code = parts[1].upper()
+    
+    # Validate registration code
+    role = None
+    if code == ADMIN_REGISTRATION_CODE:
+        role = 'admin'
+    elif code == USER_REGISTRATION_CODE:
+        role = 'user'
+    else:
+        response = "❌ Código de registro inválido.\n\nContacta al administrador para obtener un código válido."
+        send_message(chat_id, response)
+        return
+    
+    # Request phone number
+    pending_registrations[chat_id] = {
+        'role': role,
+        'awaiting_phone': True,
+        'started_at': datetime.now()
+    }
+    
+    response = f"✅ Código válido ({role.upper()})\n\n"
+    response += "📱 <b>Paso 2: Compartir tu número de teléfono</b>\n\n"
+    response += "Por favor comparte tu número de teléfono usando el botón de abajo.\n\n"
+    response += "⚠️ <b>Importante:</b>\n"
+    response += "• Debe ser un número mexicano (10 dígitos)\n"
+    response += "• El número quedará asociado a esta cuenta"
+    
+    # Create keyboard with contact request button
+    keyboard = {
+        "keyboard": [[{
+            "text": "📱 Compartir mi número",
+            "request_contact": True
+        }]],
+        "one_time_keyboard": True,
+        "resize_keyboard": True
+    }
+    
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": response,
+        "parse_mode": "HTML",
+        "reply_markup": keyboard
+    }
+    
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        logger.error(f"Error sending contact request: {e}")
+
+
+def handle_contact_registration(message):
+    """Handle contact sharing for registration"""
+    chat_id = message["chat"]["id"]
+    contact = message.get("contact", {})
+    phone_number = contact.get("phone_number", "")
+    user_name = message["from"].get("first_name", "User")
+    
+    # Check if user is in registration process
+    if chat_id not in pending_registrations:
+        response = "❌ No hay un proceso de registro activo.\n\nUsa /register primero."
+        send_message(chat_id, response)
+        return
+    
+    registration_data = pending_registrations[chat_id]
+    
+    # Validate Mexican phone number
+    is_valid, cleaned_phone = validate_mexican_phone(phone_number)
+    
+    if not is_valid:
+        response = "❌ <b>Número de teléfono inválido</b>\n\n"
+        response += "El número debe ser mexicano (10 dígitos).\n\n"
+        response += f"Recibido: {phone_number}\n\n"
+        response += "Por favor comparte un número válido o usa /register para reiniciar."
+        send_message(chat_id, response)
+        return
+    
+    logger.info(f"Registration attempt: chat_id={chat_id}, phone={cleaned_phone}, role={registration_data['role']}")
+    
+    # Attempt to register
+    success, result_message = register_user(chat_id, cleaned_phone, registration_data['role'])
+    
+    if success:
+        # Registration successful
+        del pending_registrations[chat_id]
+        
+        role_text = "Administrador" if registration_data['role'] == 'admin' else "Usuario"
+        response = "✅ <b>¡Registro Exitoso!</b>\n\n"
+        response += f"👤 Nombre: {user_name}\n"
+        response += f"📱 Teléfono: {cleaned_phone}\n"
+        response += f"🎫 Rol: {role_text}\n"
+        response += f"🕐 {get_mexico_city_time()}\n\n"
+        response += "Ya puedes usar todos los comandos del bot.\n\n"
+        response += "Usa /help para ver los comandos disponibles."
+        send_message(chat_id, response)
+        
+        logger.info(f"User registered successfully: {cleaned_phone} as {registration_data['role']}")
+        
+    elif result_message == "DUPLICATE_PHONE":
+        # Phone number already registered to different chat_id
+        handle_duplicate_phone(chat_id, cleaned_phone, registration_data['role'])
+    else:
+        # Other error
+        del pending_registrations[chat_id]
+        send_message(chat_id, f"❌ {result_message}")
+
+
+def handle_duplicate_phone(chat_id, phone, role):
+    """Handle case where phone number is already registered"""
+    user_data, phone_hash = get_user_by_phone(phone)
+    existing_chat_id = user_data.get('chat_id')
+    
+    # Generate verification code
+    verification_code = generate_verification_code()
+    expires_at = datetime.now() + timedelta(seconds=VERIFICATION_CODE_TIMEOUT)
+    
+    # Store verification request
+    pending_verifications[chat_id] = {
+        'code': verification_code,
+        'phone': phone,
+        'role': role,
+        'expires_at': expires_at,
+        'original_chat_id': existing_chat_id
+    }
+    
+    # Remove from pending registrations
+    if chat_id in pending_registrations:
+        del pending_registrations[chat_id]
+    
+    # Send verification code to original user
+    if existing_chat_id:
+        try:
+            existing_chat_id_int = int(existing_chat_id)
+            alert_message = "🚨 <b>Alerta de Seguridad</b>\n\n"
+            alert_message += "Alguien está intentando registrarse con tu número de teléfono.\n\n"
+            alert_message += f"📱 Teléfono: {phone}\n"
+            alert_message += f"🕐 {get_mexico_city_time()}\n\n"
+            alert_message += "Si eres tú en un nuevo dispositivo, usa este código:\n\n"
+            alert_message += f"<code>{verification_code}</code>\n\n"
+            alert_message += "⏱️ Válido por 5 minutos.\n\n"
+            alert_message += "❌ Si NO eres tú, ignora este mensaje."
+            send_message(existing_chat_id_int, alert_message)
+        except Exception as e:
+            logger.error(f"Error sending verification code to original user: {e}")
+    
+    # Inform new user
+    response = "⚠️ <b>Número ya registrado</b>\n\n"
+    response += "Este número ya está asociado a otra cuenta.\n\n"
+    response += "Se ha enviado un <b>código de verificación</b> al dispositivo original.\n\n"
+    response += "Si eres tú en un nuevo dispositivo:\n"
+    response += "1. Revisa el mensaje en tu dispositivo anterior\n"
+    response += "2. Envía el código de 6 dígitos aquí\n\n"
+    response += "⏱️ Tienes 5 minutos para verificar.\n\n"
+    response += "Usa /register para reiniciar."
+    send_message(chat_id, response)
+    
+    logger.warning(f"Duplicate phone attempt: {phone}, new_chat_id={chat_id}, existing_chat_id={existing_chat_id}")
+
+
+def handle_verification_code(chat_id, code):
+    """Handle verification code input"""
+    if chat_id not in pending_verifications:
+        return
+    
+    verification_data = pending_verifications[chat_id]
+    
+    # Check if expired
+    if datetime.now() > verification_data['expires_at']:
+        del pending_verifications[chat_id]
+        response = "❌ <b>Código expirado</b>\n\n"
+        response += "El tiempo de verificación ha expirado.\n\n"
+        response += "Usa /register para intentar de nuevo."
+        send_message(chat_id, response)
+        return
+    
+    # Verify code
+    if code.strip() == verification_data['code']:
+        # Code is correct - transfer account
+        phone = verification_data['phone']
+        role = verification_data['role']
+        old_chat_id = verification_data['original_chat_id']
+        
+        # Update user with new chat_id
+        users = load_users()
+        phone_hash = hash_phone(phone)
+        
+        if phone_hash in users:
+            users[phone_hash]['chat_id'] = str(chat_id)
+            users[phone_hash]['last_verification'] = get_mexico_city_time()
+            save_users(users)
+            
+            del pending_verifications[chat_id]
+            
+            response = "✅ <b>Verificación Exitosa</b>\n\n"
+            response += "Tu cuenta ha sido transferida a este dispositivo.\n\n"
+            response += f"📱 Teléfono: {phone}\n"
+            response += f"🕐 {get_mexico_city_time()}\n\n"
+            response += "Ya puedes usar el bot normalmente.\n\n"
+            response += "Usa /help para ver los comandos disponibles."
+            send_message(chat_id, response)
+            
+            # Notify old device
+            if old_chat_id:
+                try:
+                    old_chat_id_int = int(old_chat_id)
+                    old_device_msg = "⚠️ <b>Cuenta Transferida</b>\n\n"
+                    old_device_msg += "Tu cuenta ha sido transferida a un nuevo dispositivo.\n\n"
+                    old_device_msg += f"🕐 {get_mexico_city_time()}\n\n"
+                    old_device_msg += "Si no fuiste tú, contacta al administrador inmediatamente."
+                    send_message(old_chat_id_int, old_device_msg)
+                except:
+                    pass
+            
+            logger.info(f"Account transferred: phone={phone}, old_chat={old_chat_id}, new_chat={chat_id}")
+        else:
+            response = "❌ Error en la verificación. Usa /register para intentar de nuevo."
+            send_message(chat_id, response)
+    else:
+        response = "❌ <b>Código incorrecto</b>\n\n"
+        response += "El código no coincide. Verifica e intenta de nuevo.\n\n"
+        response += "Usa /register para reiniciar el proceso."
+        send_message(chat_id, response)
+
+
+def handle_registration_code(chat_id, text):
+    """Handle registration code input (legacy/backup method)"""
+    # This is a fallback in case we need text-based phone input
+    pass
+
+
+def handle_report_command(chat_id, text, user_name):
+    """Handle /report command for reporting wrong parking count"""
+    try:
+        parts = text.split()
+        
+        if len(parts) < 2:
+            response = "🚨 <b>Reportar Conteo Incorrecto</b>\n\n"
+            response += "Si crees que el conteo de espacios es incorrecto, repórtalo.\n\n"
+            response += "<b>Uso:</b>\n"
+            response += "/report &lt;número&gt;\n\n"
+            response += "<b>Ejemplo:</b>\n"
+            response += "/report 20 (si crees que hay 20 espacios ocupados)\n\n"
+            response += "⏱️ Solo puedes reportar cada 5 minutos.\n"
+            response += "📢 Los administradores recibirán tu reporte."
+            send_message(chat_id, response)
+            return
+        
+        # Check cooldown
+        can_report_now, minutes_remaining = can_report(chat_id)
+        
+        if not can_report_now:
+            response = f"⏱️ <b>Espera un momento</b>\n\n"
+            response += f"Puedes reportar nuevamente en <b>{minutes_remaining} minuto(s)</b>.\n\n"
+            response += "Esto previene spam y ayuda a mantener reportes de calidad."
+            send_message(chat_id, response)
+            return
+        
+        # Parse reported count
+        try:
+            reported_count = int(parts[1])
+            
+            if not (0 <= reported_count <= MAX_PARKING_SPACES):
+                response = f"❌ Número fuera de rango. Debe estar entre 0 y {MAX_PARKING_SPACES}"
+                send_message(chat_id, response)
+                return
+        except ValueError:
+            response = "❌ Número no válido. Debe ser un entero."
+            send_message(chat_id, response)
+            return
+        
+        # Update last report time
+        update_last_report_time(chat_id)
+        
+        # Get user info
+        user = get_user_by_chat_id(chat_id)
+        user_phone = user.get('phone', 'Desconocido')
+        
+        # Send confirmation to reporter
+        response = "✅ <b>Reporte Enviado</b>\n\n"
+        response += f"📊 Conteo reportado: {reported_count}/{MAX_PARKING_SPACES}\n"
+        response += f"📊 Conteo actual del sistema: {current_total}/{MAX_PARKING_SPACES}\n"
+        response += f"🕐 {get_mexico_city_time()}\n\n"
+        response += "Tu reporte ha sido enviado a los administradores.\n"
+        response += "¡Gracias por ayudarnos a mejorar!"
+        send_message(chat_id, response)
+        
+        # Notify admins with notifications enabled
+        admins = get_admins_with_notifications()
+        
+        admin_message = "🚨 <b>Nuevo Reporte de Usuario</b>\n\n"
+        admin_message += f"👤 Usuario: {user_name}\n"
+        admin_message += f"📱 Teléfono: {user_phone[-4:]}\n"  # Last 4 digits
+        admin_message += f"📊 Reporta: {reported_count} espacios ocupados\n"
+        admin_message += f"📊 Sistema muestra: {current_total} espacios ocupados\n"
+        admin_message += f"🔢 Diferencia: {abs(reported_count - current_total)} espacios\n"
+        admin_message += f"🕐 {get_mexico_city_time()}\n\n"
+        
+        if reported_count > current_total:
+            admin_message += "⚠️ Usuario reporta MÁS espacios ocupados de los que el sistema detecta."
+        elif reported_count < current_total:
+            admin_message += "⚠️ Usuario reporta MENOS espacios ocupados de los que el sistema detecta."
+        else:
+            admin_message += "ℹ️ Usuario confirma el conteo actual."
+        
+        for admin_chat_id in admins:
+            try:
+                send_message(int(admin_chat_id), admin_message)
+            except Exception as e:
+                logger.error(f"Error sending report to admin {admin_chat_id}: {e}")
+        
+        logger.info(f"Report submitted by {user_name} (chat_id={chat_id}): reported={reported_count}, actual={current_total}")
+        
+    except Exception as e:
+        logger.error(f"Error in handle_report_command: {e}")
+        response = "❌ Error al procesar el reporte."
+        send_message(chat_id, response)
+
+
+def handle_addadmin_command(chat_id, text, user_name):
+    """Handle /addadmin command - promote user to admin"""
+    try:
+        parts = text.split()
+        
+        if len(parts) < 2:
+            response = "👥 <b>Promover Usuario a Admin</b>\n\n"
+            response += "<b>Uso:</b>\n"
+            response += "/addadmin &lt;teléfono&gt;\n\n"
+            response += "<b>Ejemplo:</b>\n"
+            response += "/addadmin 5512345678\n\n"
+            response += "El usuario debe estar registrado previamente.\n"
+            response += "⚠️ Solo administradores pueden usar este comando."
+            send_message(chat_id, response)
+            return
+        
+        phone_input = parts[1]
+        
+        # Validate phone number
+        is_valid, cleaned_phone = validate_mexican_phone(phone_input)
+        
+        if not is_valid:
+            response = "❌ Número de teléfono inválido.\n\nDebe ser un número mexicano de 10 dígitos."
+            send_message(chat_id, response)
+            return
+        
+        # Find user by phone
+        user_data, phone_hash = get_user_by_phone(cleaned_phone)
+        
+        if not user_data:
+            response = "❌ No se encontró un usuario con ese número de teléfono.\n\n"
+            response += "El usuario debe registrarse primero usando /register"
+            send_message(chat_id, response)
+            return
+        
+        # Check if already admin
+        if user_data.get('role') == 'admin':
+            response = "ℹ️ Este usuario ya es administrador."
+            send_message(chat_id, response)
+            return
+        
+        # Promote to admin
+        users = load_users()
+        users[phone_hash]['role'] = 'admin'
+        users[phone_hash]['promoted_at'] = get_mexico_city_time()
+        users[phone_hash]['promoted_by'] = str(chat_id)
+        users[phone_hash]['notifications_enabled'] = True  # Enable notifications by default
+        save_users(users)
+        
+        # Send confirmation to promoting admin
+        response = "✅ <b>Usuario Promovido</b>\n\n"
+        response += f"📱 Teléfono: {cleaned_phone}\n"
+        response += f"🎫 Nuevo Rol: Administrador\n"
+        response += f"👤 Promovido por: {user_name}\n"
+        response += f"🕐 {get_mexico_city_time()}\n\n"
+        response += "El usuario ahora tiene acceso a todos los comandos de administrador."
+        send_message(chat_id, response)
+        
+        # Notify the promoted user if they have a chat_id
+        promoted_chat_id = user_data.get('chat_id')
+        if promoted_chat_id:
+            try:
+                promoted_msg = "🎉 <b>¡Felicitaciones!</b>\n\n"
+                promoted_msg += "Has sido promovido a <b>Administrador</b>.\n\n"
+                promoted_msg += f"👤 Promovido por: {user_name}\n"
+                promoted_msg += f"🕐 {get_mexico_city_time()}\n\n"
+                promoted_msg += "Ahora tienes acceso a:\n"
+                promoted_msg += "• Control de LEDs (/leds)\n"
+                promoted_msg += "• Modificar contador (/set)\n"
+                promoted_msg += "• Ver logs (/logs)\n"
+                promoted_msg += "• Promover otros admins (/addadmin)\n"
+                promoted_msg += "• Configurar notificaciones (/notifications)\n\n"
+                promoted_msg += "Usa /help para ver todos los comandos."
+                send_message(int(promoted_chat_id), promoted_msg)
+            except Exception as e:
+                logger.error(f"Error notifying promoted user: {e}")
+        
+        logger.info(f"User promoted to admin: phone={cleaned_phone}, by={user_name} (chat_id={chat_id})")
+        
+    except Exception as e:
+        logger.error(f"Error in handle_addadmin_command: {e}")
+        response = "❌ Error al promover usuario."
+        send_message(chat_id, response)
+
+
+def handle_notifications_command(chat_id, text):
+    """Handle /notifications command - toggle report notifications for admins"""
+    try:
+        parts = text.split()
+        
+        if len(parts) < 2:
+            # Show current status
+            user = get_user_by_chat_id(chat_id)
+            current_status = user.get('notifications_enabled', False)
+            status_text = "activadas" if current_status else "desactivadas"
+            
+            response = "🔔 <b>Notificaciones de Reportes</b>\n\n"
+            response += f"Estado actual: <b>{status_text}</b>\n\n"
+            response += "<b>Uso:</b>\n"
+            response += "/notifications on - Activar notificaciones\n"
+            response += "/notifications off - Desactivar notificaciones\n\n"
+            response += "Cuando están activadas, recibirás alertas cuando los usuarios reporten problemas con el conteo."
+            send_message(chat_id, response)
+            return
+        
+        command = parts[1].lower()
+        
+        if command not in ["on", "off"]:
+            response = "❌ Comando no válido.\n\nUsa: /notifications on o /notifications off"
+            send_message(chat_id, response)
+            return
+        
+        enabled = (command == "on")
+        
+        if update_user_notifications(chat_id, enabled):
+            status_text = "activadas ✅" if enabled else "desactivadas ❌"
+            response = f"🔔 <b>Notificaciones {status_text}</b>\n\n"
+            
+            if enabled:
+                response += "Ahora recibirás notificaciones cuando los usuarios reporten problemas con el conteo del estacionamiento."
+            else:
+                response += "Ya no recibirás notificaciones de reportes de usuarios."
+            
+            send_message(chat_id, response)
+            logger.info(f"Admin notifications {command} for chat_id={chat_id}")
+        else:
+            response = "❌ Error al actualizar las notificaciones."
+            send_message(chat_id, response)
+            
+    except Exception as e:
+        logger.error(f"Error in handle_notifications_command: {e}")
+        response = "❌ Error al procesar el comando."
         send_message(chat_id, response)
 
 
@@ -893,6 +1815,10 @@ def run_bot():
 def main():
     """Initialize MQTT listener and start bot"""
     try:
+        # Initialize first admin if needed
+        logger.info("Checking for initial admin...")
+        initialize_first_admin()
+        
         # Initialize scheduler
         logger.info("Initializing scheduler...")
         init_scheduler()
