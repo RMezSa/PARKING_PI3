@@ -25,6 +25,7 @@ services:
       - /proc:/proc
       - ./subscriber.py:/app/subscriber.py
       - ./iot_hub_client.py:/app/iot_hub_client.py
+      - ./subscriber_data:/app/data
     depends_on:
       - mosquitto-broker
     environment:
@@ -44,3 +45,18 @@ services:
       - mosquitto-broker
     env_file:
       - ./.env
+
+  telegram-bot:
+    build: ./telegram_bot
+    container_name: telegram-bot
+    restart: unless-stopped
+    depends_on:
+      - mosquitto-broker
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - MQTT_BROKER=${MQTT_BROKER}
+      - MQTT_PORT=${MQTT_PORT:-1883}
+    volumes:
+      - ./telegram_bot/data:/app/data
+      - ./get_docker_logs.sh:/host/get_docker_logs.sh:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro

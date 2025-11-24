@@ -1,0 +1,9 @@
+[Unit]
+Description=Timer to set GPIO5 ON at 17:30 daily
+
+[Timer]
+OnCalendar=*-*-* 17:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

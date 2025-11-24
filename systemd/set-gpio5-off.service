@@ -1,0 +1,13 @@
+[Unit]
+Description=Set GPIO5 OFF (daily 09:00)
+After=gpio5-manager.service
+Wants=gpio5-manager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/set_gpio5.sh off
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

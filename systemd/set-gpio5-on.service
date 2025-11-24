@@ -1,0 +1,13 @@
+[Unit]
+Description=Set GPIO5 ON (daily 17:30)
+After=gpio5-manager.service
+Wants=gpio5-manager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/set_gpio5.sh on
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Crear grupo gpio con el mismo GID que en Raspberry Pi OS
-RUN groupadd -g 993 gpio
+RUN groupadd -g 997 gpio
 
 # Crear usuario que pertenezca al grupo gpio
 RUN useradd -m -G gpio -s /bin/bash pi

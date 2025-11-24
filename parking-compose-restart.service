@@ -1,0 +1,15 @@
+[Unit]
+Description=Daily Docker Compose Restart for Parking System
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/estacionamientog/PARKING_PI3
+ExecStart=/bin/bash -c 'docker compose down && docker compose up -d'
+User=estacionamientog
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
